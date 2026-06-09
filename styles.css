@@ -260,3 +260,53 @@ tr:hover td { background: var(--surface-2); }
 .stop { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px dashed var(--border); }
 .stop::before { counter-increment: stop; content: counter(stop); width: 22px; height: 22px; background: var(--primary); color: var(--primary-ink); border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 700; flex-shrink: 0; }
 .stop:last-child { border-bottom: 0; }
+
+
+/* ============================================================
+   FleetOS v2.0 — Industry additions
+   Score chip, ML banner, alert tile, gauge ring, assigner panel
+   ============================================================ */
+.alert-strip {
+  display:flex; gap:10px; padding:12px 14px; border-radius:var(--radius-sm);
+  background:linear-gradient(90deg, rgba(255,107,107,.08), rgba(255,180,84,.04));
+  border:1px solid rgba(255,107,107,.25); margin-bottom:14px; align-items:center;
+}
+.alert-strip.warn { background:linear-gradient(90deg, rgba(255,180,84,.08), transparent); border-color:rgba(255,180,84,.3); }
+.alert-strip .pill { background:var(--danger); color:#fff; font-size:11px; font-weight:700; padding:3px 8px; border-radius:999px; letter-spacing:.05em; }
+.alert-strip.warn .pill { background:var(--warn); color:#1a1500; }
+
+.assigner {
+  border:1px solid var(--border); border-radius:var(--radius); padding:14px;
+  background:linear-gradient(135deg, rgba(255,209,102,.04), rgba(94,224,193,.02));
+  margin-top:10px;
+}
+.assigner h4 { font-family:var(--font-display); font-size:13px; letter-spacing:.05em; text-transform:uppercase; color:var(--primary); margin:0 0 8px; }
+.assign-row { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); margin-bottom:6px; background:var(--bg-2); cursor:pointer; transition:all .15s; }
+.assign-row:hover { border-color:var(--border-strong); }
+.assign-row.best { border-color:var(--primary); background:rgba(255,209,102,.06); }
+.assign-row .score { font-family:var(--font-display); font-weight:800; font-size:18px; color:var(--primary); min-width:48px; text-align:center; }
+.assign-row.best .score { color:var(--primary); }
+.assign-row .why { color:var(--text-dim); font-size:11.5px; }
+.assign-row.disabled { opacity:.4; cursor:not-allowed; }
+.score-bar { height:4px; background:var(--bg); border-radius:2px; overflow:hidden; margin-top:4px; }
+.score-bar > div { height:100%; background:linear-gradient(90deg, var(--accent), var(--primary)); }
+
+.ml-banner {
+  display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
+  background:linear-gradient(90deg, rgba(94,224,193,.15), rgba(110,168,255,.10));
+  border:1px solid rgba(94,224,193,.3); font-size:11px; color:var(--accent);
+  text-transform:uppercase; letter-spacing:.08em; font-weight:600;
+}
+.ml-banner.warn { background:linear-gradient(90deg, rgba(255,180,84,.15), transparent); border-color:rgba(255,180,84,.3); color:var(--warn); }
+
+.gauge { position:relative; width:120px; height:120px; }
+.gauge svg { transform:rotate(-90deg); }
+.gauge .gauge-bg { stroke:var(--bg-2); }
+.gauge .gauge-fg { stroke:var(--primary); transition:stroke-dashoffset .5s; }
+.gauge .gauge-text { position:absolute; inset:0; display:grid; place-items:center; font-family:var(--font-display); font-size:22px; font-weight:800; }
+
+.mtc-row.due  td { background:rgba(255,180,84,.06); }
+.mtc-row.over td { background:rgba(255,107,107,.08); }
+
+.spark { display:inline-flex; align-items:flex-end; gap:2px; height:24px; }
+.spark span { width:5px; background:var(--accent); border-radius:1px; opacity:.85; }
