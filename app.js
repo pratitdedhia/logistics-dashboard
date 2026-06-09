@@ -218,6 +218,253 @@ const Geo = {
 };
 
 
+/* ─────────────────────── §2.5 ML / SCORING ─────────────────────
+   Three industry-grade pieces live here:
+
+   (a) ML.trainETA() / ML.predictETA()
+       Closed-form linear regression (Ordinary Least Squares) learned
+       from completed trips. Features:
+            x = [1, distanceKm, stops, peakLoadKg/1000]
+       Target:
+            y = trip durationMinutes (completedAt − createdAt)
+       Falls back to a hand-tuned heuristic when fewer than 4
+       completed trips exist. No external deps — pure JS matrix math.
+
+   (b) Assigner.score(truck, driver, order, ctx)
+       Multi-criteria decision model that ranks every available truck
+       for a freshly created order. Weighted dimensions:
+            • cargo compatibility (hard filter)
+            • capacity fit  (penalises both over- and under-utilisation)
+            • depot proximity (km from truck's home depot to pickup)
+            • driver experience (years)
+            • fuel efficiency (km/L)
+            • maintenance health (km until next service)
+            • current status (available > in-trip > maintenance)
+       Returns { score 0–100, breakdown[] }. Used by the order modal
+       to recommend a truck and to drive the manual-override UI.
+
+   (c) Maintenance.evaluate(truck)
+       Computes serviceDueKm, dueSoon (≤ 500 km), overdue (≤ 0),
+       used by the dashboard alert strip and the Maintenance view.
+   ──────────────────────────────────────────────────────────────── */
+
+const ML = {
+  model: null,         // { w: [b, β1, β2, β3], n, r2, trainedAt }
+
+  // Matrix helpers (small enough for closed-form OLS).
+  _transpose(M)      { return M[0].map((_, c) => M.map(r => r[c])); },
+  _matmul(A, B) {
+    const n = A.length, m = B[0].length, k = B.length;
+    const C = Array.from({ length: n }, () => new Array(m).fill(0));
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < m; j++)
+        for (let p = 0; p < k; p++) C[i][j] += A[i][p] * B[p][j];
+    return C;
+  },
+  // 4×4 inverse via Gauss-Jordan; sufficient for our 4-feature model.
+  _inv4(A) {
+    const n = A.length;
+    const M = A.map((r, i) => r.concat(Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))));
+    for (let i = 0; i < n; i++) {
+      let piv = i;
+      for (let r = i + 1; r < n; r++) if (Math.abs(M[r][i]) > Math.abs(M[piv][i])) piv = r;
+      if (Math.abs(M[piv][i]) < 1e-9) return null;
+      [M[i], M[piv]] = [M[piv], M[i]];
+      const d = M[i][i];
+      for (let c = 0; c < 2 * n; c++) M[i][c] /= d;
+      for (let r = 0; r < n; r++) if (r !== i) {
+        const f = M[r][i];
+        for (let c = 0; c < 2 * n; c++) M[r][c] -= f * M[i][c];
+      }
+    }
+    return M.map(r => r.slice(n));
+  },
+
+  // Build dataset from completed trips. Skips rows with missing data.
+  _dataset() {
+    return DB.list('trips').filter(t =>
+      t.status === 'completed' && t.completedAt && t.createdAt && t.totalDistanceKm > 0
+    ).map(t => {
+      const durMin = Math.max(1, (new Date(t.completedAt) - new Date(t.createdAt)) / 60000);
+      return {
+        x: [1, t.totalDistanceKm, (t.waypoints || []).length || 2, (t.peakLoadKg || 0) / 1000],
+        y: durMin,
+      };
+    });
+  },
+
+  trainETA() {
+    const data = ML._dataset();
+    if (data.length < 4) { ML.model = null; return { ok: false, reason: 'need ≥ 4 completed trips' }; }
+    const X = data.map(d => d.x);
+    const y = data.map(d => [d.y]);
+    const Xt  = ML._transpose(X);
+    const XtX = ML._matmul(Xt, X);
+    const XtXi = ML._inv4(XtX);
+    if (!XtXi) { ML.model = null; return { ok: false, reason: 'singular matrix' }; }
+    const w = ML._matmul(ML._matmul(XtXi, Xt), y).map(r => r[0]);
+    // R² on training data — honest, not held-out, but fine for our scale.
+    const yMean = y.reduce((s, [v]) => s + v, 0) / y.length;
+    let ssRes = 0, ssTot = 0;
+    for (let i = 0; i < y.length; i++) {
+      const pred = X[i].reduce((s, v, k) => s + v * w[k], 0);
+      ssRes += (y[i][0] - pred) ** 2;
+      ssTot += (y[i][0] - yMean) ** 2;
+    }
+    const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+    ML.model = { w, n: data.length, r2, trainedAt: new Date().toISOString() };
+    DB.state.mlModel = ML.model; DB.save();
+    return { ok: true, ...ML.model };
+  },
+
+  // Predict trip duration in minutes. Uses learned model if available,
+  // otherwise a city-traffic heuristic: 40 km/h average + 8 min/stop.
+  predictETA({ distanceKm, stops = 2, peakKg = 0 }) {
+    const m = ML.model || DB.state.mlModel;
+    if (m && m.w) {
+      const x = [1, distanceKm, stops, peakKg / 1000];
+      const min = Math.max(15, x.reduce((s, v, k) => s + v * m.w[k], 0));
+      return { minutes: min, source: 'ml', r2: m.r2, n: m.n };
+    }
+    const min = Math.max(15, (distanceKm / 40) * 60 + stops * 8);
+    return { minutes: min, source: 'heuristic' };
+  },
+};
+
+const Assigner = {
+  /* Returns ranked list of { truck, driver, score, breakdown[], blockers[] }
+     for an order. Trucks the order is *incompatible* with are excluded.
+     Drivers are matched to the truck's existing assignedDriver if any,
+     else the most-experienced available driver. */
+  rank(order) {
+    const trucks  = DB.list('trucks');
+    const drivers = DB.list('drivers');
+    const depots  = DB.list('depots');
+    const pickup  = (order.stops || []).find(s => s.action === 'pickup') || order.pickup || (depots[0] && { lat: depots[0].lat, lng: depots[0].lng });
+    return trucks.map(t => {
+      const breakdown = [];
+      const blockers  = [];
+
+      // 1) Cargo compatibility — hard requirement.
+      const cargoOk = truckCarries(t, order.cargoType);
+      if (!cargoOk) blockers.push(`cannot carry ${order.cargoType||'general'}`);
+      const cargoScore = cargoOk ? 100 : 0;
+      breakdown.push({ k: 'Cargo compat',     v: cargoScore, w: 0.18 });
+
+      // 2) Capacity fit — bell-curve around ~70% utilisation.
+      const wUtil = t.capacityKg ? (order.weightKg / t.capacityKg) : 1;
+      const vUtil = t.capacityVolumeM3 ? (order.volumeM3 / t.capacityVolumeM3) : 1;
+      const util  = Math.max(wUtil, vUtil);
+      const over  = util > 1;
+      if (over) blockers.push(`over capacity (${Math.round(util*100)}%)`);
+      const fitScore = over ? 0 : Math.max(0, 100 - Math.abs(util - 0.7) * 140);
+      breakdown.push({ k: 'Capacity fit',     v: Math.round(fitScore), w: 0.22 });
+
+      // 3) Depot proximity to pickup.
+      const homeDepot = depots.find(d => d.id === (t.homeDepotId || (depots[0] && depots[0].id))) || depots[0];
+      const km = homeDepot && pickup ? Geo.haversine(homeDepot, pickup) : 0;
+      const proxScore = Math.max(0, 100 - km * 0.8);   // 100 km away → 20.
+      breakdown.push({ k: 'Depot proximity',  v: Math.round(proxScore), w: 0.18 });
+
+      // 4) Driver experience (years).
+      const driver = drivers.find(d => d.assignedTruckId === t.id && d.status === 'available')
+                  || drivers.filter(d => d.status === 'available').sort((a,b)=>b.experienceYears-a.experienceYears)[0]
+                  || null;
+      const expScore = Math.min(100, (driver ? driver.experienceYears : 0) * 8);
+      breakdown.push({ k: 'Driver experience',v: Math.round(expScore), w: 0.10 });
+
+      // 5) Fuel efficiency.
+      const fuelScore = Math.min(100, (t.mileageKmpl || 0) * 6);
+      breakdown.push({ k: 'Fuel efficiency',  v: Math.round(fuelScore), w: 0.10 });
+
+      // 6) Maintenance health.
+      const mh = Maintenance.evaluate(t);
+      const mScore = mh.overdue ? 0 : Math.min(100, (mh.kmToService / 50));   // ≥5000 km away → 100
+      if (mh.overdue) blockers.push('service overdue');
+      breakdown.push({ k: 'Maintenance',      v: Math.round(mScore), w: 0.12 });
+
+      // 7) Current status.
+      const statusScore = t.status === 'available' ? 100 : t.status === 'in-trip' ? 35 : 0;
+      if (t.status === 'maintenance') blockers.push('in maintenance');
+      breakdown.push({ k: 'Availability',     v: statusScore, w: 0.10 });
+
+      const score = blockers.length
+        ? 0
+        : Math.round(breakdown.reduce((s, b) => s + b.v * b.w, 0));
+
+      return { truck: t, driver, score, breakdown, blockers };
+    }).sort((a, b) => b.score - a.score);
+  },
+
+  // Most-likely best assignment, or null if none viable.
+  recommend(order) {
+    const ranked = Assigner.rank(order);
+    return (ranked[0] && ranked[0].score > 0) ? ranked[0] : null;
+  },
+};
+
+const Maintenance = {
+  evaluate(truck) {
+    const odo      = +truck.odometerKm || 0;
+    const lastSvc  = +truck.lastServiceKm || 0;
+    const interval = +truck.serviceIntervalKm || 10000;
+    const dueAt    = lastSvc + interval;
+    const kmToService = dueAt - odo;
+    return {
+      odo, lastSvc, interval, dueAt, kmToService,
+      dueSoon: kmToService > 0 && kmToService <= 500,
+      overdue: kmToService <= 0,
+    };
+  },
+
+  // All trucks that are due-soon or overdue.
+  alerts() {
+    return DB.list('trucks')
+      .map(t => ({ truck: t, ...Maintenance.evaluate(t) }))
+      .filter(x => x.dueSoon || x.overdue)
+      .sort((a, b) => a.kmToService - b.kmToService);
+  },
+
+  // Mark a truck serviced — reset lastServiceKm to current odometer.
+  markServiced(truckId) {
+    const t = DB.get('trucks', truckId);
+    if (!t) return;
+    DB.update('trucks', truckId, { lastServiceKm: +t.odometerKm || 0, status: 'available' });
+  },
+};
+
+// Delayed in-progress trips: estimatedFinishAt < now.
+function getDelayAlerts() {
+  const now = Date.now();
+  return DB.list('trips', t => t.status === 'in-progress' && t.estimatedFinishAt)
+    .map(t => ({ trip: t, lateMin: Math.round((now - new Date(t.estimatedFinishAt)) / 60000) }))
+    .filter(x => x.lateMin > 0);
+}
+
+function renderAlertStrips() {
+  const mAlerts = Maintenance.alerts();
+  const dAlerts = getDelayAlerts();
+  if (!mAlerts.length && !dAlerts.length) return '';
+  const parts = [];
+  if (dAlerts.length) {
+    parts.push(`<div class="alert-strip">
+      <span class="pill">DELAY</span>
+      <div><b>${dAlerts.length} trip${dAlerts.length>1?'s':''} past predicted ETA.</b>
+        <span class="muted" style="margin-left:6px">${dAlerts.slice(0,3).map(d => `${d.trip.tripNo} +${d.lateMin}m`).join(' · ')}</span></div></div>`);
+  }
+  if (mAlerts.length) {
+    const overdue = mAlerts.filter(a => a.overdue).length;
+    parts.push(`<div class="alert-strip ${overdue?'':'warn'}">
+      <span class="pill">SERVICE</span>
+      <div><b>${mAlerts.length} truck${mAlerts.length>1?'s':''} need attention</b>
+        <span class="muted" style="margin-left:6px">${overdue} overdue · ${mAlerts.length-overdue} due soon</span></div>
+      <div class="spacer"></div>
+      <button class="btn sm ghost" onclick="Router.go('maintenance')">Open Maintenance →</button></div>`);
+  }
+  return parts.join('');
+}
+
+
 /* ───────────────────────── §3 DATABASE ───────────────────── */
 const DB_KEY = 'fleetos:v1';
 
@@ -239,6 +486,7 @@ const DB = {
     return {
       trucks: [], drivers: [], depots: [], orders: [], trips: [],
       settings: { fuelPricePerLiter: 95, currency: 'INR', companyName: 'FleetOS Logistics Pvt. Ltd.' },
+      mlModel: null,
       createdAt: new Date().toISOString(),
     };
   },
@@ -348,6 +596,53 @@ function seedDemoData() {
       status: 'pending',
     });
   }
+
+  // Industry add-ons: maintenance odometer + home depot on each truck.
+  DB.list('trucks').forEach((t, i) => {
+    const odo = 28000 + Math.floor(Math.random() * 95000);
+    const interval = 10000;
+    // Stagger lastServiceKm so the demo shows a healthy mix:
+    //  - one truck overdue, one due-soon, the rest fine.
+    const offset = i === 0 ? interval + 200 : i === 1 ? interval - 250 : Math.floor(Math.random() * 7000);
+    DB.update('trucks', t.id, {
+      odometerKm: odo,
+      lastServiceKm: Math.max(0, odo - offset),
+      serviceIntervalKm: interval,
+      homeDepotId: DB.list('depots')[i % DB.list('depots').length].id,
+    });
+  });
+
+  // Synthesise 8 completed historical trips so the ML model has data to learn from.
+  // Realistic-ish: durationMinutes ≈ distance/38*60 + stops*9 + load·0.04 + noise.
+  const depotsAll = DB.list('depots');
+  const trucksAll = DB.list('trucks');
+  const driversAll = DB.list('drivers').filter(d => d.status === 'available');
+  for (let i = 0; i < 8; i++) {
+    const depot = depotsAll[i % depotsAll.length];
+    const truck = trucksAll[i % trucksAll.length];
+    const driver = driversAll[i % Math.max(1, driversAll.length)];
+    const targetDrops = SEED.drops.slice(i, i + 3).map(d => ({ lat: d.lat, lng: d.lng, label: d.city }));
+    const start = { lat: depot.lat, lng: depot.lng, label: depot.name };
+    const route = Geo.optimizeRoute(start, targetDrops, true);
+    const peak = 1200 + Math.floor(Math.random() * 3000);
+    const dur  = Math.round((route.distanceKm / 38) * 60 + route.path.length * 9 + peak * 0.04 + (Math.random() * 30 - 15));
+    const created   = new Date(Date.now() - (10 + i) * 86400000);
+    const completed = new Date(created.getTime() + dur * 60000);
+    DB.insert('trips', {
+      tripNo: 'TRIP-' + (2900 + i),
+      truckId: truck.id, driverId: driver ? driver.id : null, depotId: depot.id,
+      orderIds: [], waypoints: route.path,
+      totalDistanceKm: +route.distanceKm.toFixed(2),
+      fuelLiters: +(route.distanceKm / Math.max(1, truck.mileageKmpl)).toFixed(2),
+      estimatedCost: Math.round((route.distanceKm / Math.max(1, truck.mileageKmpl)) * DB.state.settings.fuelPricePerLiter),
+      strategy: route.strategy, peakLoadKg: peak, peakLoadM3: 4,
+      createdAt: created.toISOString(),
+      completedAt: completed.toISOString(),
+      estimatedFinishAt: completed.toISOString(),
+      status: 'completed',
+    });
+  }
+  ML.trainETA();
 }
 
 
@@ -450,6 +745,7 @@ Views.dashboard = {
     const maxV = Math.max(1, ...last7.map(x => x.v));
 
     root.innerHTML = `
+      ${renderAlertStrips()}
       <div class="grid grid-4">
         ${kpi('Total Trucks', trucks.length, `${trucks.filter(t=>t.status==='available').length} available`, 'accent')}
         ${kpi('Active Trips', active, `${trips.length} total ever`, 'info')}
@@ -575,6 +871,17 @@ function editTruck(id) {
         <div class="field"><label>Status</label>
           <select id="f-st">${['available','in-trip','maintenance'].map(s=>`<option ${s===t.status?'selected':''}>${s}</option>`).join('')}</select>
         </div>
+      </div>
+      <h3 style="margin-top:6px;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Maintenance</h3>
+      <div class="field-row">
+        <div class="field"><label>Odometer (km)</label><input id="f-odo" type="number" value="${t.odometerKm||0}"/></div>
+        <div class="field"><label>Last service @ (km)</label><input id="f-lsv" type="number" value="${t.lastServiceKm||0}"/></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Service interval (km)</label><input id="f-int" type="number" value="${t.serviceIntervalKm||10000}"/></div>
+        <div class="field"><label>Home depot</label>
+          <select id="f-hd"><option value="">— None —</option>${DB.list('depots').map(dp=>`<option value="${dp.id}" ${dp.id===t.homeDepotId?'selected':''}>${dp.name}</option>`).join('')}</select>
+        </div>
       </div>`,
     actions: [
       { label: 'Cancel', variant: 'ghost', onClick: c => c() },
@@ -587,6 +894,10 @@ function editTruck(id) {
           capacityVolumeM3: +$('#f-vol').value,
           mileageKmpl: +$('#f-mil').value,
           status: $('#f-st').value,
+          odometerKm: +($('#f-odo')?.value || 0),
+          lastServiceKm: +($('#f-lsv')?.value || 0),
+          serviceIntervalKm: +($('#f-int')?.value || 10000),
+          homeDepotId: $('#f-hd')?.value || null,
         };
         if (!data.regNo || !data.model) return UI.toast('Reg No and Model are required', 'err');
         if (data.capacityKg <= 0) return UI.toast('Capacity must be > 0', 'err');
@@ -825,7 +1136,15 @@ function editOrder(id) {
         <div class="spacer"></div>
         <button class="btn sm ghost" type="button" id="add-stop">+ Add stop</button>
       </div>
-      <div id="stops-editor"></div>`;
+      <div id="stops-editor"></div>
+
+      <div class="divider"></div>
+      <div class="row" style="margin-bottom:6px">
+        <h3 style="margin:0">Truck assignment</h3>
+        <span class="ml-banner" style="margin-left:8px">smart scoring</span>
+        <span class="muted" style="font-size:11.5px;margin-left:8px">Top match auto-selected. Click any row to override.</span>
+      </div>
+      <div id="assigner-block" class="assigner"><div class="empty" style="padding:14px">Fill in cargo type + weight to see suggestions.</div></div>`;
 
       const renderStops = () => {
         const wrap = body.querySelector('#stops-editor');
@@ -851,6 +1170,64 @@ function editOrder(id) {
         });
       };
       renderStops();
+
+      // -- Assigner panel: ranked truck recommendations for this order --
+      const currentAssign = { truckId: base.assignedTruckId || null, driverId: base.assignedDriverId || null };
+      const renderAssigner = () => {
+        const wrap = body.querySelector('#assigner-block');
+        const draft = {
+          cargoType: body.querySelector('#o-ct').value,
+          weightKg: +body.querySelector('#o-w').value,
+          volumeM3: +body.querySelector('#o-v').value,
+          stops,
+        };
+        if (!draft.weightKg) { wrap.innerHTML = '<div class="empty" style="padding:14px">Enter weight to score trucks.</div>'; return; }
+        const ranked = Assigner.rank(draft);
+        if (!currentAssign.truckId && ranked[0] && ranked[0].score > 0) {
+          currentAssign.truckId = ranked[0].truck.id;
+          currentAssign.driverId = ranked[0].driver ? ranked[0].driver.id : null;
+        }
+        wrap.innerHTML = `
+          <h4>Recommended assignment · ranked ${ranked.length} trucks</h4>
+          ${ranked.slice(0, 6).map((r, i) => {
+            const sel = r.truck.id === currentAssign.truckId;
+            const dis = r.score === 0;
+            const why = r.blockers.length
+              ? `<span class="badge danger">blocked</span> ${r.blockers.join(' · ')}`
+              : r.breakdown.map(b => `${b.k.split(' ')[0]} ${b.v}`).join(' · ');
+            return `<div class="assign-row ${sel?'best':''} ${dis?'disabled':''}" data-tid="${r.truck.id}" data-did="${r.driver?r.driver.id:''}">
+              <div class="score">${r.score}</div>
+              <div style="flex:1">
+                <b>${r.truck.regNo}</b> <span class="muted" style="font-size:11.5px">· ${r.truck.model} · ${fmt.kg(r.truck.capacityKg)}</span>
+                <div class="why">${why}${r.driver?` · driver: <b>${r.driver.name}</b>`:''}</div>
+                <div class="score-bar"><div style="width:${r.score}%"></div></div>
+              </div>
+              ${sel?'<span class="badge ok">selected</span>':'<span class="badge mute">alt</span>'}
+            </div>`;
+          }).join('')}
+          <div class="row" style="margin-top:8px">
+            <span class="muted" style="font-size:11.5px">Weights: cargo .18 · fit .22 · proximity .18 · maint .12 · driver .10 · fuel .10 · status .10</span>
+            <div class="spacer"></div>
+            <button class="btn sm ghost" id="clear-assign" type="button">Clear assignment</button>
+          </div>`;
+        wrap.querySelectorAll('.assign-row').forEach(row => {
+          row.onclick = () => {
+            if (row.classList.contains('disabled')) return;
+            currentAssign.truckId = row.dataset.tid;
+            currentAssign.driverId = row.dataset.did || null;
+            renderAssigner();
+          };
+        });
+        const cb = wrap.querySelector('#clear-assign');
+        if (cb) cb.onclick = () => { currentAssign.truckId = null; currentAssign.driverId = null; renderAssigner(); };
+      };
+      renderAssigner();
+      ['#o-ct','#o-w','#o-v'].forEach(sel => {
+        const el = body.querySelector(sel);
+        if (el) el.addEventListener('input', renderAssigner);
+      });
+      // Expose for the Save handler.
+      body._currentAssign = currentAssign;
 
       body.querySelector('#add-stop').onclick = () => {
         const dep = DB.get('depots', body.querySelector('#o-dep').value) || depots[0];
@@ -885,6 +1262,8 @@ function editOrder(id) {
           priority: $('#o-p').value,
           scheduledDate: new Date($('#o-s').value || Date.now()).toISOString(),
           status: base.status || 'pending',
+          assignedTruckId: (document.querySelector('.modal-body') && document.querySelector('.modal-body')._currentAssign) ? document.querySelector('.modal-body')._currentAssign.truckId : null,
+          assignedDriverId: (document.querySelector('.modal-body') && document.querySelector('.modal-body')._currentAssign) ? document.querySelector('.modal-body')._currentAssign.driverId : null,
         };
         if (!data.customerName) return UI.toast('Customer required','err');
         if (data.weightKg <= 0) return UI.toast('Total weight must be > 0','err');
@@ -918,8 +1297,16 @@ Views.planner = {
       return;
     }
 
-    // Filter trucks to those compatible with every selected order's cargo type.
+    // Honour pre-assignment chosen at order-creation time the first time we land here.
     const selOrders0 = Array.from(s.selectedOrderIds).map(id => DB.get('orders', id)).filter(Boolean);
+    if (!s.truckId) {
+      const preTruck = selOrders0.map(o => o.assignedTruckId).find(Boolean)
+                    || DB.list('orders', o => o.status==='pending' && o.assignedTruckId).map(o=>o.assignedTruckId)[0];
+      if (preTruck) s.truckId = preTruck;
+      const preDriver = selOrders0.map(o => o.assignedDriverId).find(Boolean);
+      if (preDriver) s.driverId = preDriver;
+    }
+    // Filter trucks to those compatible with every selected order's cargo type.
     const compatTrucks = allTrucks.filter(tr => selOrders0.every(o => truckCarries(tr, o.cargoType)));
     const trucks = selOrders0.length ? compatTrucks : allTrucks;
     if (!s.truckId || !trucks.find(t => t.id === s.truckId)) s.truckId = trucks[0]?.id || null;
@@ -1062,6 +1449,14 @@ Views.planner = {
           <div><div class="muted" style="font-size:11px">PEAK LOAD</div><div style="font-family:var(--font-display);font-size:22px">${fmt.kg(peakKg)}</div></div>
         </div>
         <div class="muted" style="font-size:11.5px">Strategy: ${opt.strategy}</div>
+        ${(() => {
+          const eta = ML.predictETA({ distanceKm, stops: timeline.length, peakKg });
+          const h = Math.floor(eta.minutes / 60), m = Math.round(eta.minutes % 60);
+          const label = eta.source === 'ml' ? `ML ETA · R²=${eta.r2.toFixed(2)} · n=${eta.n}` : 'Heuristic ETA (train ML in Reports)';
+          return `<div style="margin-top:6px"><span class="ml-banner ${eta.source==='ml'?'':'warn'}">${label}</span>
+                  <span style="margin-left:8px;font-family:var(--font-display);font-size:18px">${h}h ${m}m</span>
+                  <span class="muted" style="font-size:11.5px;margin-left:6px">predicted door-to-door</span></div>`;
+        })()}
         <div class="divider"></div>
         <div class="stops">
           ${timeline.map((p,i) => {
@@ -1099,6 +1494,8 @@ Views.planner = {
         peakLoadKg: Math.round(s.result.peakKg),
         peakLoadM3: +s.result.peakM3.toFixed(2),
         status: 'in-progress',
+        estimatedDurationMin: Math.round(ML.predictETA({ distanceKm: s.result.opt.distanceKm, stops: s.result.timeline.length, peakKg: s.result.peakKg }).minutes),
+        estimatedFinishAt: new Date(Date.now() + ML.predictETA({ distanceKm: s.result.opt.distanceKm, stops: s.result.timeline.length, peakKg: s.result.peakKg }).minutes * 60000).toISOString(),
       });
       DB.update('trucks', truck.id, { status: 'in-trip' });
       if (driver) DB.update('drivers', driver.id, { status: 'on-trip', assignedTruckId: truck.id });
@@ -1253,12 +1650,42 @@ Views.reports = {
       return { name: d.name, trips: dt.length, distance: dt.reduce((s,t)=>s+(t.totalDistanceKm||0),0), revenue: dt.reduce((s,t)=>s+(t.estimatedCost||0),0) };
     }).sort((a,b) => b.distance - a.distance);
 
+    const trucks   = DB.list('trucks');
+    const onTime   = trips.filter(t => t.status==='completed' && t.estimatedFinishAt && t.completedAt && new Date(t.completedAt) <= new Date(t.estimatedFinishAt)).length;
+    const otPct    = completed ? Math.round((onTime / completed) * 100) : 0;
+    const costPerKm = totalDist ? Math.round(totalCost / totalDist) : 0;
+    const utilPct  = trucks.length ? Math.round((trucks.filter(t=>t.status==='in-trip').length / trucks.length) * 100) : 0;
+    const ml = DB.state.mlModel || ML.model;
+
     root.innerHTML = `
+      ${renderAlertStrips()}
       <div class="grid grid-4">
         ${kpi('Total trips', trips.length, `${completed} completed`)}
         ${kpi('Distance run', fmt.km(totalDist), '', 'info')}
         ${kpi('Fuel burned', fmt.number(totalFuel,0)+' L', '', 'warn')}
         ${kpi('Revenue', fmt.money(totalCost), '', 'ok')}
+      </div>
+      <div class="grid grid-4" style="margin-top:14px">
+        ${kpi('On-time %', otPct + '%', `${onTime}/${completed} on schedule`, 'ok')}
+        ${kpi('Cost / km', fmt.money(costPerKm), 'fuel-only basis', 'info')}
+        ${kpi('Fleet utilization', utilPct + '%', `${trucks.filter(t=>t.status==='in-trip').length}/${trucks.length} on road`, 'warn')}
+        ${kpi('ML model', ml ? `R²=${ml.r2.toFixed(2)}` : '—', ml ? `${ml.n} trips · trained ${fmt.date(ml.trainedAt)}` : 'No model · run Train', 'accent')}
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title"><h3>ETA prediction model</h3>
+          <div><button class="btn ghost sm" id="train-ml">Train / retrain</button></div></div>
+        <p class="muted" style="font-size:12.5px;margin:0 0 8px">
+          Ordinary least-squares linear regression on completed trips. Features: distance, stop count, peak load.
+          Used by the Trip Planner to predict door-to-door duration and by the Dashboard to flag delays.
+        </p>
+        ${ml ? `<div class="row" style="gap:18px">
+          <div><div class="muted" style="font-size:11px">INTERCEPT</div><b>${ml.w[0].toFixed(2)} min</b></div>
+          <div><div class="muted" style="font-size:11px">β · distance</div><b>${ml.w[1].toFixed(3)} min/km</b></div>
+          <div><div class="muted" style="font-size:11px">β · stops</div><b>${ml.w[2].toFixed(2)} min/stop</b></div>
+          <div><div class="muted" style="font-size:11px">β · load (t)</div><b>${ml.w[3].toFixed(2)} min/ton</b></div>
+          <div><div class="muted" style="font-size:11px">R²</div><b>${ml.r2.toFixed(3)}</b></div>
+          <div><div class="muted" style="font-size:11px">SAMPLE</div><b>${ml.n} trips</b></div>
+        </div>` : '<div class="empty" style="padding:20px">Train the model after completing at least 4 trips. Seed demo data to bootstrap with 8 synthetic trips.</div>'}
       </div>
       <div class="card" style="margin-top:16px">
         <div class="card-title"><h3>Driver leaderboard</h3></div>
@@ -1280,9 +1707,67 @@ Views.reports = {
           </tr>`).join('') || '<tr><td colspan="5" class="empty">No trips yet.</td></tr>'}</tbody>
         </table></div>
       </div>`;
+    const tb = document.getElementById('train-ml');
+    if (tb) tb.onclick = () => {
+      const r = ML.trainETA();
+      UI.toast(r.ok ? `Model trained · R²=${r.r2.toFixed(2)} (n=${r.n})` : `Train failed: ${r.reason}`, r.ok ? 'ok' : 'err');
+      Router.go('reports');
+    };
   },
 };
 
+
+
+/* — Maintenance — */
+Views.maintenance = {
+  title: 'Maintenance',
+  subtitle: 'Service intervals · health · alerts',
+  render(root) {
+    const trucks = DB.list('trucks');
+    const rows = trucks.map(t => ({ truck: t, ...Maintenance.evaluate(t) }))
+      .sort((a, b) => a.kmToService - b.kmToService);
+    const overdue = rows.filter(r => r.overdue).length;
+    const dueSoon = rows.filter(r => r.dueSoon).length;
+    const healthy = rows.length - overdue - dueSoon;
+
+    root.innerHTML = `
+      <div class="grid grid-4">
+        ${kpi('Fleet size', trucks.length, '')}
+        ${kpi('Overdue', overdue, 'service required now', 'warn')}
+        ${kpi('Due soon', dueSoon, '≤ 500 km away', 'info')}
+        ${kpi('Healthy', healthy, '', 'ok')}
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title">
+          <h3>Service schedule</h3>
+          <span class="muted" style="font-size:11.5px">Click <b>Mark serviced</b> after a workshop visit — resets the counter.</span>
+        </div>
+        <div class="t-wrap"><table>
+          <thead><tr><th>Truck</th><th>Type</th><th>Odometer</th><th>Last service @</th><th>Next due</th><th>Km left</th><th>Status</th><th></th></tr></thead>
+          <tbody>${rows.map(r => {
+            const cls = r.overdue ? 'over' : r.dueSoon ? 'due' : '';
+            const status = r.overdue ? '<span class="badge danger">overdue</span>'
+                          : r.dueSoon ? '<span class="badge warn">due soon</span>'
+                          : '<span class="badge ok">healthy</span>';
+            return `<tr class="mtc-row ${cls}">
+              <td><b>${r.truck.regNo}</b><div class="muted" style="font-size:11px">${r.truck.model}</div></td>
+              <td>${TRUCK_TYPES[r.truck.truckType||'regular']?.label || 'Regular'}</td>
+              <td>${fmt.number(r.odo)} km</td>
+              <td>${fmt.number(r.lastSvc)} km</td>
+              <td>${fmt.number(r.dueAt)} km</td>
+              <td><b style="color:${r.overdue?'var(--danger)':r.dueSoon?'var(--warn)':'var(--text)'}">${r.overdue?'−':''}${fmt.number(Math.abs(r.kmToService))} km</b></td>
+              <td>${status}</td>
+              <td class="right"><button class="btn sm ghost" data-svc="${r.truck.id}">Mark serviced</button></td>
+            </tr>`;
+          }).join('') || '<tr><td colspan="8" class="empty">No trucks.</td></tr>'}</tbody>
+        </table></div>
+      </div>`;
+    $$('[data-svc]', root).forEach(b => b.onclick = () => UI.confirm('Mark this truck as serviced now?', () => {
+      Maintenance.markServiced(b.dataset.svc);
+      UI.toast('Service recorded', 'ok'); Router.go('maintenance');
+    }));
+  },
+};
 
 /* — Settings — */
 Views.settings = {
@@ -1394,6 +1879,24 @@ function runSelfTests() {
 
   const bf = Geo.bruteForce(mum, stops);
   assert('Brute-force ≤ 2-opt', Geo.pathLength([...bf, mum]) <= opt.distanceKm + 1e-6);
+
+  // ML / Assigner / Maintenance sanity
+  const eta = ML.predictETA({ distanceKm: 100, stops: 4, peakKg: 1500 });
+  assert('ETA > 0 minutes', eta.minutes > 0, `got ${eta.minutes.toFixed(1)}`);
+
+  const mh = Maintenance.evaluate({ odometerKm: 9800, lastServiceKm: 0, serviceIntervalKm: 10000 });
+  assert('Maintenance due-soon flag', mh.dueSoon === true, `kmToService=${mh.kmToService}`);
+
+  const mh2 = Maintenance.evaluate({ odometerKm: 11000, lastServiceKm: 0, serviceIntervalKm: 10000 });
+  assert('Maintenance overdue flag', mh2.overdue === true);
+
+  // Tiny synthetic OLS check — y exactly = 2 + 3·x1
+  const fakeTrips = [{x:[1,10,2,1],y:32+30},{x:[1,20,2,1],y:32+60},{x:[1,30,2,1],y:32+90},{x:[1,40,2,1],y:32+120}];
+  const Xf = fakeTrips.map(t=>t.x), yf=fakeTrips.map(t=>[t.y]);
+  const Xt = ML._transpose(Xf); const inv = ML._inv4(ML._matmul(Xt, Xf));
+  const w = inv ? ML._matmul(ML._matmul(inv, Xt), yf).map(r=>r[0]) : null;
+  assert('OLS β₁ recovers ≈ 3', w && Math.abs(w[1] - 3) < 0.5, `got w=${w && w.map(v=>v.toFixed(2)).join(',')}`);
+
   console.groupEnd();
 }
 
